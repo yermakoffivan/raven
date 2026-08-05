@@ -22,7 +22,11 @@
  (package nx)
  (modules
   :standard
-  \ backend_contract test_backend_contract test_nx_support test_nx_io)
+  \
+  backend_contract
+  test_backend_contract
+  test_nx_support
+  test_nx_io)
  (libraries nx.buffer nx nx.core nx.effect windtrap test_nx_support))
 
 (test
