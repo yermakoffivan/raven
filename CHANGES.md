@@ -13,17 +13,16 @@ All notable changes to this project will be documented in this file.
 
 ### Ppx_ptree (new)
 
+- Add `~mirror` to the deriver: `[@@deriving ptree ~mirror]` on a concrete
+  record also generates its payload-generic `module Uniform`, `to_uniform`, and
+  — when every leaf dtype is statically known — a dtype-checked `of_uniform`.
+- Extend `[@@deriving ptree]` to payload-generic types: a type with one
+  parameter occurring outside tensor leaves derives `map`, `map2`, `iter`,
+  `fold` and `fold2` over dot-joined leaf paths, plus `names : 'a t -> string t`.
 - Add the `ppx_ptree` deriver, which generates the `map`, `map2`, and `iter`
   operations required by `Nx.Ptree.S` for records, products, containers, and
   recursive parameter types, with generated code and diagnostics located at the
   originating source forms.
-- Extend `[@@deriving ptree]` to payload-generic types: on a type with one
-  parameter occurring outside tensor leaves it derives the uniform traversals
-  (`map`, `map2`, `iter`, `fold` and `fold2` with dot-joined leaf paths, and
-  `names : 'a t -> string t`, the tree of leaf paths). Concrete types keep the
-  rank-2 traversals, and `[@@deriving ptree ~mirror]` additionally generates
-  their uniform mirror (`module Uniform`, `to_uniform`, and — when leaf dtypes
-  are statically known — `of_uniform` with per-leaf error paths).
 - Add a runnable linear-regression example using a derived parameter module
   directly with `Rune.grad` and `Rune.jit2`.
 
@@ -370,6 +369,12 @@ thread.
 
 ### Nx
 
+- Add `Nx.Ptree.Uniform`, the module type of payload-generic structures
+  (`map`, `map2`, `iter`, and `fold`/`fold2` over dot-joined leaf paths), and
+  `Nx.Ptree.Make`, which turns one into an `Nx.Ptree.S` with packed tensor
+  leaves — so one `'a params` declaration serves both the model and
+  parameter-shaped data. `Nx.Ptree.unpack` recovers a typed tensor from a
+  packed leaf, naming the position in the error on a dtype mismatch.
 - **Breaking:** the real FFT family (`rfft`, `irfft`, `hfft`, `ihfft` and their
   2-D/N-D variants) and `fftfreq`/`rfftfreq` now take the output dtype first,
   like the constructors. It selects storage precision independent of the
@@ -623,12 +628,6 @@ thread.
   user structure implementing its three traversals (`map`, `map2`, `iter`).
   A stock dynamic tree (`Ptree.t` with tensor, list, and dict nodes) covers
   structures only known at runtime.
-- Add `Nx.Ptree.Uniform`, the module type of payload-generic structures
-  (`map`, `map2`, `iter`, `fold` and `fold2` with dot-joined leaf paths), and
-  the `Nx.Ptree.Make` functor deriving an `Nx.Ptree.S` from any `Uniform` with
-  packed tensor leaves, so one `'a params` declaration serves both the model
-  and parameter-shaped data. Add `Nx.Ptree.unpack` for dtype-checked
-  unpacking of packed tensors with an optional path in the error message.
 - Require OCaml >= 5.5.0 (module-dependent functions are used by the
   `Ptree.S`-based APIs downstream).
 - Fix `flatten` raising on rank-0 tensors; it now reshapes them to `[|1|]`.
