@@ -490,6 +490,7 @@ let signature_errors errors =
 let located_lid ~loc path = { txt = path; loc }
 let lident ~loc name = located_lid ~loc (Longident.Lident name)
 let append_lid path name = Longident.Ldot (path, name)
+let stdlib_operator name = Longident.Ldot (Lident "Stdlib", name)
 let ident ~loc path = B.pexp_ident ~loc (located_lid ~loc path)
 let evar ~loc name = B.evar ~loc name
 let pvar ~loc name = B.pvar ~loc name
@@ -771,7 +772,7 @@ and map2_list ~loc ~function_path ~path callback shape left right =
           [ evar ~loc right_name ] );
     ]
     (B.pexp_ifthenelse ~loc
-       (call ~loc (Longident.Lident "<>")
+       (call ~loc (stdlib_operator "<>")
           [ evar ~loc left_length; evar ~loc right_length ])
        (invalid_argument ~loc
           (mismatch_message function_path "list length" path))
@@ -810,7 +811,7 @@ and map2_array ~loc ~function_path ~path callback shape left right =
           [ evar ~loc right_name ] );
     ]
     (B.pexp_ifthenelse ~loc
-       (call ~loc (Longident.Lident "<>")
+       (call ~loc (stdlib_operator "<>")
           [ evar ~loc left_length; evar ~loc right_length ])
        (invalid_argument ~loc
           (mismatch_message function_path "array length" path))
@@ -1522,24 +1523,68 @@ let ucomponent_rec_flag component =
       else Nonrecursive
   | _ -> Recursive
 
-(* Leaf paths: [None] at the root, otherwise a string expression holding the
-   dot-joined segments so far. Top-level segments are bare; deeper segments are
-   appended with ["."], matching the checkpoint naming convention. *)
+(* Leaf paths. Record fields and tuple positions are known while expanding, so a
+   path stays a literal until a container index or a delegated sub-path makes it
+   depend on the value. Segments are joined with ["."], matching the checkpoint
+   naming convention; the root is the empty path. *)
 
-let ujoin ~loc path segment =
+type upath = Uroot | Uliteral of string | Ucomputed of expression
+
+let concat ~loc left right = call ~loc (stdlib_operator "^") [ left; right ]
+
+let ujoin_literal ~loc path segment =
   match path with
-  | None -> segment
-  | Some path ->
-      call ~loc (Longident.Lident "^")
-        [
-          call ~loc (Longident.Lident "^") [ path; B.estring ~loc "." ]; segment;
-        ]
+  | Uroot -> Uliteral segment
+  | Uliteral prefix -> Uliteral (prefix ^ "." ^ segment)
+  | Ucomputed prefix ->
+      Ucomputed (concat ~loc prefix (B.estring ~loc ("." ^ segment)))
+
+let ujoin_computed ~loc path segment =
+  match path with
+  | Uroot -> Ucomputed segment
+  | Uliteral prefix ->
+      Ucomputed (concat ~loc (B.estring ~loc (prefix ^ ".")) segment)
+  | Ucomputed prefix ->
+      Ucomputed (concat ~loc (concat ~loc prefix (B.estring ~loc ".")) segment)
 
 let upath_expr ~loc path =
-  match path with None -> B.estring ~loc "" | Some path -> path
+  match path with
+  | Uroot -> B.estring ~loc ""
+  | Uliteral path -> B.estring ~loc path
+  | Ucomputed path -> path
 
-let umismatch_message function_path kind =
-  Format.sprintf "%s: %s mismatch" function_path kind
+(* A delegated traversal numbers its leaves from its own root, so a payload
+   sitting at that root hands back the empty path. Joining it unconditionally
+   would leave a trailing separator. *)
+let ujoin_delegated ~loc path segment =
+  let guarded prefix =
+    B.pexp_ifthenelse ~loc
+      (call ~loc
+         (Longident.parse "Stdlib.String.equal")
+         [ segment; B.estring ~loc "" ])
+      (upath_expr ~loc prefix)
+      (Some (upath_expr ~loc (ujoin_computed ~loc prefix segment)))
+  in
+  match path with
+  | Uroot -> segment
+  | Uliteral _ -> guarded path
+  | Ucomputed prefix ->
+      let name = gen_symbol ~prefix:"ptree_prefix" () in
+      let_one ~loc name prefix (guarded (Ucomputed (evar ~loc name)))
+
+let uindex_path ~loc path index =
+  ujoin_computed ~loc path
+    (call ~loc (Longident.parse "Stdlib.string_of_int") [ evar ~loc index ])
+
+let umismatch ~loc ~function_path ~path kind =
+  let message = Format.sprintf "%s: %s mismatch at " function_path kind in
+  match path with
+  | Uroot -> invalid_argument ~loc (message ^ "<root>")
+  | Uliteral path -> invalid_argument ~loc (message ^ path)
+  | Ucomputed path ->
+      call ~loc
+        (Longident.Ldot (Lident "Stdlib", "invalid_arg"))
+        [ concat ~loc (B.estring ~loc message) path ]
 
 (* map *)
 
@@ -1602,7 +1647,7 @@ let rec umap_expr fvar shape expr =
 
 (* map2 *)
 
-let rec umap2_expr ~function_path fvar shape left right =
+let rec umap2_expr ~function_path ~path fvar shape left right =
   let loc = shape.uloc in
   match shape.udesc with
   | UPayload -> call ~loc (Lident fvar) [ left; right ]
@@ -1625,7 +1670,9 @@ let rec umap2_expr ~function_path fvar shape left right =
       let mapped =
         List.mapi
           (fun index shape ->
-            umap2_expr ~function_path fvar shape
+            umap2_expr ~function_path
+              ~path:(ujoin_literal ~loc path (string_of_int index))
+              fvar shape
               (evar ~loc:shape.uloc (List.nth left_names index))
               (evar ~loc:shape.uloc (List.nth right_names index)))
           shapes
@@ -1663,13 +1710,11 @@ let rec umap2_expr ~function_path fvar shape left right =
             ~rhs:
               (construct ~loc "Some"
                  (Some
-                    (umap2_expr ~function_path fvar shape
+                    (umap2_expr ~function_path ~path fvar shape
                        (evar ~loc:shape.uloc left_value)
                        (evar ~loc:shape.uloc right_value))));
           B.case ~lhs:(B.ppat_any ~loc) ~guard:None
-            ~rhs:
-              (invalid_argument ~loc
-                 (umismatch_message function_path "option constructor"));
+            ~rhs:(umismatch ~loc ~function_path ~path "option constructor");
         ]
   | UList shape ->
       let left_name = gen_symbol ~prefix:"ptree_left" () in
@@ -1679,14 +1724,14 @@ let rec umap2_expr ~function_path fvar shape left right =
       let mapper =
         B.pexp_fun ~loc Nolabel None (pvar ~loc left_value)
           (B.pexp_fun ~loc Nolabel None (pvar ~loc right_value)
-             (umap2_expr ~function_path fvar shape
+             (umap2_expr ~function_path ~path fvar shape
                 (evar ~loc:shape.uloc left_value)
                 (evar ~loc:shape.uloc right_value)))
       in
       lets ~loc
         [ (left_name, left); (right_name, right) ]
         (B.pexp_ifthenelse ~loc
-           (call ~loc (Longident.Lident "<>")
+           (call ~loc (stdlib_operator "<>")
               [
                 call ~loc
                   (Longident.parse "Stdlib.List.length")
@@ -1695,8 +1740,7 @@ let rec umap2_expr ~function_path fvar shape left right =
                   (Longident.parse "Stdlib.List.length")
                   [ evar ~loc right_name ];
               ])
-           (invalid_argument ~loc
-              (umismatch_message function_path "list length"))
+           (umismatch ~loc ~function_path ~path "list length")
            (Some
               (call ~loc
                  (Longident.parse "Stdlib.List.map2")
@@ -1713,7 +1757,7 @@ let rec umap2_expr ~function_path fvar shape left right =
       in
       let array_initializer =
         B.pexp_fun ~loc Nolabel None (pvar ~loc index)
-          (umap2_expr ~function_path fvar shape (value_at left_name)
+          (umap2_expr ~function_path ~path fvar shape (value_at left_name)
              (value_at right_name))
       in
       lets ~loc
@@ -1726,15 +1770,14 @@ let rec umap2_expr ~function_path fvar shape left right =
               [ evar ~loc left_name ] );
         ]
         (B.pexp_ifthenelse ~loc
-           (call ~loc (Longident.Lident "<>")
+           (call ~loc (stdlib_operator "<>")
               [
                 evar ~loc length_name;
                 call ~loc
                   (Longident.parse "Stdlib.Array.length")
                   [ evar ~loc right_name ];
               ])
-           (invalid_argument ~loc
-              (umismatch_message function_path "array length"))
+           (umismatch ~loc ~function_path ~path "array length")
            (Some
               (call ~loc
                  (Longident.parse "Stdlib.Array.init")
@@ -1801,7 +1844,8 @@ let udelegate_callback ~loc ~path fvar arity =
        (fun name body -> B.pexp_fun ~loc Nolabel None (pvar ~loc name) body)
        rest
        (call ~loc (Lident fvar)
-          (ujoin ~loc path (evar ~loc sub_path) :: List.map (evar ~loc) rest)))
+          (ujoin_delegated ~loc path (evar ~loc sub_path)
+          :: List.map (evar ~loc) rest)))
 
 let rec ufold_expr ~path fvar shape expr acc_expr =
   let loc = shape.uloc in
@@ -1825,8 +1869,7 @@ let rec ufold_expr ~path fvar shape expr acc_expr =
           (fun (index, acc) shape name ->
             ( index + 1,
               ufold_expr
-                ~path:
-                  (Some (ujoin ~loc path (B.estring ~loc (string_of_int index))))
+                ~path:(ujoin_literal ~loc path (string_of_int index))
                 fvar shape (evar ~loc name) acc ))
           (0, acc_expr) shapes names
       in
@@ -1855,13 +1898,7 @@ let rec ufold_expr ~path fvar shape expr acc_expr =
       let index = gen_symbol ~prefix:"ptree_index" () in
       let value = gen_symbol ~prefix:"ptree_value" () in
       let pair = gen_symbol ~prefix:"ptree_pair" () in
-      let child_path =
-        Some
-          (ujoin ~loc path
-             (call ~loc
-                (Longident.parse "Stdlib.string_of_int")
-                [ evar ~loc index ]))
-      in
+      let child_path = uindex_path ~loc path index in
       let inner_body =
         B.pexp_let ~loc Nonrecursive
           [
@@ -1892,13 +1929,7 @@ let rec ufold_expr ~path fvar shape expr acc_expr =
       let index = gen_symbol ~prefix:"ptree_index" () in
       let value = gen_symbol ~prefix:"ptree_value" () in
       let pair = gen_symbol ~prefix:"ptree_pair" () in
-      let child_path =
-        Some
-          (ujoin ~loc path
-             (call ~loc
-                (Longident.parse "Stdlib.string_of_int")
-                [ evar ~loc index ]))
-      in
+      let child_path = uindex_path ~loc path index in
       let inner_body =
         B.pexp_let ~loc Nonrecursive
           [
@@ -1954,8 +1985,7 @@ let rec ufold2_expr ~function_path ~path fvar shape left right acc_expr =
           (fun (index, acc) shape (left_name, right_name) ->
             ( index + 1,
               ufold2_expr ~function_path
-                ~path:
-                  (Some (ujoin ~loc path (B.estring ~loc (string_of_int index))))
+                ~path:(ujoin_literal ~loc path (string_of_int index))
                 fvar shape (evar ~loc left_name) (evar ~loc right_name) acc ))
           (0, acc_expr) shapes
           (List.combine left_names right_names)
@@ -1997,9 +2027,7 @@ let rec ufold2_expr ~function_path ~path fvar shape left right acc_expr =
                     (evar ~loc:shape.uloc right_value)
                     (evar ~loc acc_name));
              B.case ~lhs:(B.ppat_any ~loc) ~guard:None
-               ~rhs:
-                 (invalid_argument ~loc
-                    (umismatch_message function_path "option constructor"));
+               ~rhs:(umismatch ~loc ~function_path ~path "option constructor");
            ])
   | UList shape ->
       let left_name = gen_symbol ~prefix:"ptree_left" () in
@@ -2009,13 +2037,7 @@ let rec ufold2_expr ~function_path ~path fvar shape left right acc_expr =
       let left_value = gen_symbol ~prefix:"ptree_left_value" () in
       let right_value = gen_symbol ~prefix:"ptree_right_value" () in
       let pair = gen_symbol ~prefix:"ptree_pair" () in
-      let child_path =
-        Some
-          (ujoin ~loc path
-             (call ~loc
-                (Longident.parse "Stdlib.string_of_int")
-                [ evar ~loc index ]))
-      in
+      let child_path = uindex_path ~loc path index in
       let inner_body =
         B.pexp_let ~loc Nonrecursive
           [
@@ -2029,7 +2051,7 @@ let rec ufold2_expr ~function_path ~path fvar shape left right acc_expr =
       lets ~loc
         [ (left_name, left); (right_name, right) ]
         (B.pexp_ifthenelse ~loc
-           (call ~loc (Longident.Lident "<>")
+           (call ~loc (stdlib_operator "<>")
               [
                 call ~loc
                   (Longident.parse "Stdlib.List.length")
@@ -2038,8 +2060,7 @@ let rec ufold2_expr ~function_path ~path fvar shape left right acc_expr =
                   (Longident.parse "Stdlib.List.length")
                   [ evar ~loc right_name ];
               ])
-           (invalid_argument ~loc
-              (umismatch_message function_path "list length"))
+           (umismatch ~loc ~function_path ~path "list length")
            (Some
               (call ~loc
                  (Longident.parse "Stdlib.List.fold_left2")
@@ -2066,13 +2087,7 @@ let rec ufold2_expr ~function_path ~path fvar shape left right acc_expr =
       let length_name = gen_symbol ~prefix:"ptree_length" () in
       let acc_name = gen_symbol ~prefix:"ptree_acc" () in
       let index = gen_symbol ~prefix:"ptree_index" () in
-      let child_path =
-        Some
-          (ujoin ~loc path
-             (call ~loc
-                (Longident.parse "Stdlib.string_of_int")
-                [ evar ~loc index ]))
-      in
+      let child_path = uindex_path ~loc path index in
       let value_at array =
         call ~loc
           (Longident.parse "Stdlib.Array.unsafe_get")
@@ -2088,15 +2103,14 @@ let rec ufold2_expr ~function_path ~path fvar shape left right acc_expr =
               [ evar ~loc left_name ] );
         ]
         (B.pexp_ifthenelse ~loc
-           (call ~loc (Longident.Lident "<>")
+           (call ~loc (stdlib_operator "<>")
               [
                 evar ~loc length_name;
                 call ~loc
                   (Longident.parse "Stdlib.Array.length")
                   [ evar ~loc right_name ];
               ])
-           (invalid_argument ~loc
-              (umismatch_message function_path "array length"))
+           (umismatch ~loc ~function_path ~path "array length")
            (Some
               (call ~loc
                  (Longident.parse "Stdlib.Array.fold_left")
@@ -2137,7 +2151,7 @@ let rec unames_expr ~path shape expr =
       call ~loc map_target
         [
           B.pexp_fun ~loc Nolabel None (pvar ~loc sub_path)
-            (ujoin ~loc path (evar ~loc sub_path));
+            (ujoin_delegated ~loc path (evar ~loc sub_path));
           call ~loc names_target [ expr ];
         ]
   | UTuple shapes ->
@@ -2159,9 +2173,7 @@ let rec unames_expr ~path shape expr =
            (List.mapi
               (fun index shape ->
                 unames_expr
-                  ~path:
-                    (Some
-                       (ujoin ~loc path (B.estring ~loc (string_of_int index))))
+                  ~path:(ujoin_literal ~loc path (string_of_int index))
                   shape
                   (evar ~loc (List.nth names index)))
               shapes))
@@ -2199,12 +2211,7 @@ let rec unames_expr ~path shape expr =
           B.pexp_fun ~loc Nolabel None (pvar ~loc index)
             (B.pexp_fun ~loc Nolabel None value_pattern
                (unames_expr
-                  ~path:
-                    (Some
-                       (ujoin ~loc path
-                          (call ~loc
-                             (Longident.parse "Stdlib.string_of_int")
-                             [ evar ~loc index ])))
+                  ~path:(uindex_path ~loc path index)
                   shape (evar ~loc value)));
           expr;
         ]
@@ -2222,12 +2229,7 @@ let rec unames_expr ~path shape expr =
           B.pexp_fun ~loc Nolabel None (pvar ~loc index)
             (B.pexp_fun ~loc Nolabel None value_pattern
                (unames_expr
-                  ~path:
-                    (Some
-                       (ujoin ~loc path
-                          (call ~loc
-                             (Longident.parse "Stdlib.string_of_int")
-                             [ evar ~loc index ])))
+                  ~path:(uindex_path ~loc path index)
                   shape (evar ~loc value)));
           expr;
         ]
@@ -2257,9 +2259,7 @@ let uoperation_body ~loc ~function_path operation ubody =
   let input = evar ~loc "x" in
   let second = evar ~loc "y" in
   let accumulator = evar ~loc "acc" in
-  let field_path label =
-    Some (B.estring ~loc:label.pld_loc label.pld_name.txt)
-  in
+  let field_path label = Uliteral label.pld_name.txt in
   match (operation, ubody) with
   | `Umap, UAlias shape -> umap_expr "f" shape input
   | `Umap, URecord fields ->
@@ -2271,14 +2271,15 @@ let uoperation_body ~loc ~function_path operation ubody =
                umap_expr "f" shape (field ~loc:label.pld_loc input label),
                label ))
            fields)
-  | `Umap2, UAlias shape -> umap2_expr ~function_path "f" shape input second
+  | `Umap2, UAlias shape ->
+      umap2_expr ~function_path ~path:Uroot "f" shape input second
   | `Umap2, URecord fields ->
       urecord ~loc
         (List.map
            (fun (label, shape) ->
              ( label.pld_loc,
                gen_symbol ~prefix:("ptree_" ^ label.pld_name.txt) (),
-               umap2_expr ~function_path "f" shape
+               umap2_expr ~function_path ~path:(field_path label) "f" shape
                  (field ~loc:label.pld_loc input label)
                  (field ~loc:label.pld_loc second label),
                label ))
@@ -2290,7 +2291,7 @@ let uoperation_body ~loc ~function_path operation ubody =
            (fun (label, shape) ->
              uiter_expr "f" shape (field ~loc:label.pld_loc input label))
            fields)
-  | `Ufold, UAlias shape -> ufold_expr ~path:None "f" shape input accumulator
+  | `Ufold, UAlias shape -> ufold_expr ~path:Uroot "f" shape input accumulator
   | `Ufold, URecord fields ->
       List.fold_left
         (fun acc (label, shape) ->
@@ -2299,7 +2300,7 @@ let uoperation_body ~loc ~function_path operation ubody =
             acc)
         accumulator fields
   | `Ufold2, UAlias shape ->
-      ufold2_expr ~function_path ~path:None "f" shape input second accumulator
+      ufold2_expr ~function_path ~path:Uroot "f" shape input second accumulator
   | `Ufold2, URecord fields ->
       List.fold_left
         (fun acc (label, shape) ->
@@ -2309,7 +2310,7 @@ let uoperation_body ~loc ~function_path operation ubody =
             acc)
         accumulator fields
   | `Unames, UAlias shape ->
-      let body = unames_expr ~path:None shape input in
+      let body = unames_expr ~path:Uroot shape input in
       if unames_uses_input ubody then body
       else
         B.pexp_sequence ~loc
@@ -2700,11 +2701,7 @@ let pack_leaf ~loc expr =
 let unpack_leaf ~loc ~path ~dtype expr =
   B.pexp_apply ~loc
     (ident ~loc (Longident.parse "Nx.Ptree.unpack"))
-    [
-      (Labelled "at", B.estring ~loc (String.concat "." (List.rev path)));
-      (Nolabel, dtype);
-      (Nolabel, expr);
-    ]
+    [ (Labelled "at", upath_expr ~loc path); (Nolabel, dtype); (Nolabel, expr) ]
 
 let rec to_uniform_shape shape expr =
   let loc = shape.loc in
@@ -2779,7 +2776,7 @@ let rec of_uniform_shape ~path shape core_type expr =
            (List.mapi
               (fun index shape ->
                 of_uniform_shape
-                  ~path:(string_of_int index :: path)
+                  ~path:(ujoin_literal ~loc path (string_of_int index))
                   shape (List.nth arguments index)
                   (evar ~loc (List.nth names index)))
               shapes))
@@ -2802,25 +2799,33 @@ let rec of_uniform_shape ~path shape core_type expr =
                        (evar ~loc value))));
         ]
   | List shape ->
+      let index = gen_symbol ~prefix:"ptree_index" () in
       let value = gen_symbol ~prefix:"ptree_value" () in
       call ~loc
-        (Longident.parse "Stdlib.List.map")
+        (Longident.parse "Stdlib.List.mapi")
         [
-          B.pexp_fun ~loc Nolabel None (pvar ~loc value)
-            (of_uniform_shape ~path shape
-               (container_argument core_type)
-               (evar ~loc value));
+          B.pexp_fun ~loc Nolabel None (pvar ~loc index)
+            (B.pexp_fun ~loc Nolabel None (pvar ~loc value)
+               (of_uniform_shape
+                  ~path:(uindex_path ~loc path index)
+                  shape
+                  (container_argument core_type)
+                  (evar ~loc value)));
           expr;
         ]
   | Array shape ->
+      let index = gen_symbol ~prefix:"ptree_index" () in
       let value = gen_symbol ~prefix:"ptree_value" () in
       call ~loc
-        (Longident.parse "Stdlib.Array.map")
+        (Longident.parse "Stdlib.Array.mapi")
         [
-          B.pexp_fun ~loc Nolabel None (pvar ~loc value)
-            (of_uniform_shape ~path shape
-               (container_argument core_type)
-               (evar ~loc value));
+          B.pexp_fun ~loc Nolabel None (pvar ~loc index)
+            (B.pexp_fun ~loc Nolabel None (pvar ~loc value)
+               (of_uniform_shape
+                  ~path:(uindex_path ~loc path index)
+                  shape
+                  (container_argument core_type)
+                  (evar ~loc value)));
           expr;
         ]
 
@@ -3009,7 +3014,7 @@ let mirror_of_uniform ~loc declaration =
   let body =
     match declaration.body with
     | Some (Alias shape) ->
-        of_uniform_shape ~path:[] shape
+        of_uniform_shape ~path:Uroot shape
           (Option.get declaration.type_decl.ptype_manifest)
           (evar ~loc "u")
     | Some (Record fields) ->
@@ -3017,7 +3022,7 @@ let mirror_of_uniform ~loc declaration =
           (List.map
              (fun (label, shape) ->
                ( lident ~loc:label.pld_name.loc label.pld_name.txt,
-                 of_uniform_shape ~path:[ label.pld_name.txt ] shape
+                 of_uniform_shape ~path:(Uliteral label.pld_name.txt) shape
                    label.pld_type
                    (B.pexp_field ~loc:label.pld_loc (evar ~loc "u")
                       (located_lid ~loc:label.pld_name.loc
